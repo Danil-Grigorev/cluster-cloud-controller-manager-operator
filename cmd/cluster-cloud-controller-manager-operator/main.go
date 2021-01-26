@@ -35,6 +35,7 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/cluster-cloud-controller-manager-operator/controllers"
+	"github.com/openshift/cluster-cloud-controller-manager-operator/pkg/platform"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -47,6 +48,8 @@ var (
 	renewDealine  = 110 * time.Second
 	retryPeriod   = 90 * time.Second
 )
+
+const defaultManagedNamespace = "cluster-cloud-controller-manager"
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -89,12 +92,19 @@ func main() {
 		"The duration that non-leader candidates will wait after observing a leadership renewal until attempting to acquire leadership of a led but unrenewed leader slot. This is effectively the maximum duration that a leader can be stopped before it is replaced by another candidate. This is only applicable if leader election is enabled.",
 	)
 
+	managedNamespace := flag.String(
+		"namespace",
+		defaultManagedNamespace,
+		"The namespace for managed objects, where out-of-tree CCM binaries will run.",
+	)
+
 	flag.Parse()
 
 	ctrl.SetLogger(klogr.New().WithName("CCMOperator"))
 
 	syncPeriod := 10 * time.Minute
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Namespace:               *managedNamespace,
 		Scheme:                  scheme,
 		SyncPeriod:              &syncPeriod,
 		MetricsBindAddress:      *metricsAddr,
@@ -113,8 +123,9 @@ func main() {
 	}
 
 	if err = (&controllers.CloudOperatorReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:        mgr.GetClient(),
+		PlatformOwner: &platform.InfrastrucutreOwner{},
+		Scheme:        mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterOperator")
 		os.Exit(1)

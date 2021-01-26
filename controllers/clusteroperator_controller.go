@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	configv1 "github.com/openshift/api/config/v1"
+	"github.com/openshift/cluster-cloud-controller-manager-operator/pkg/platform"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +31,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/openshift/library-go/pkg/config/clusteroperator/v1helpers"
 )
@@ -45,7 +49,9 @@ var relatedObjects = []configv1.ObjectReference{}
 // CloudOperatorReconciler reconciles a ClusterOperator object
 type CloudOperatorReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	platform.PlatformOwner
+	Scheme  *runtime.Scheme
+	watcher ObjectWatcher
 }
 
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusteroperators,verbs=get;list;watch;create;update;patch;delete
@@ -54,12 +60,50 @@ type CloudOperatorReconciler struct {
 
 // Reconcile will process the cloud-controller-manager clusterOperator
 func (r *CloudOperatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	keys, err := r.PlatformOwner.List(ctx, r.Client)
+	if err != nil {
+		klog.Errorf("Unable to list platform objects %T: %+v", r.Object(), err)
+		return ctrl.Result{}, err
+	}
+
+	for _, platformPointer := range keys {
+		if err := r.sync(ctx, platformPointer); err != nil {
+			klog.Errorf("Unable to sync operands: %s", err)
+		}
+	}
 
 	if err := r.statusAvailable(ctx); err != nil {
 		klog.Errorf("Unable to sync cluster operator status: %s", err)
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *CloudOperatorReconciler) sync(ctx context.Context, key client.ObjectKey) error {
+	resources, err := r.GetObjects(ctx, r.Client, key)
+	if err != nil {
+		return err
+	}
+
+	for _, resource := range resources {
+		if err := ApplyServerSide(ctx, r.Client, clusterOperatorName, resource); err != nil {
+			klog.Errorf("Unable to apply object %T '%s': %+v", resource, resource.GetName(), err)
+			return err
+		}
+
+		if err := r.watcher.Watch(ctx, resource); err != nil {
+			klog.Errorf("Unable to establish watch on object %T '%s': %+v", resource, resource.GetName(), err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ApplyServerSide(ctx context.Context, c client.Client, owner client.FieldOwner, obj client.Object, opts ...client.PatchOption) error {
+	opts = append([]client.PatchOption{client.ForceOwnership, owner}, opts...)
+	return c.Patch(ctx, obj, client.Apply, opts...)
 }
 
 // statusAvailable sets the Available condition to True, with the given reason
@@ -144,17 +188,48 @@ func (r *CloudOperatorReconciler) syncStatus(ctx context.Context, co *configv1.C
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CloudOperatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&configv1.ClusterOperator{}, builder.WithPredicates(predicate.Funcs{
-			CreateFunc:  func(e event.CreateEvent) bool { return clusterOperatorFilter(e.Object) },
-			UpdateFunc:  func(e event.UpdateEvent) bool { return clusterOperatorFilter(e.ObjectNew) },
-			GenericFunc: func(e event.GenericEvent) bool { return clusterOperatorFilter(e.Object) },
-			DeleteFunc:  func(e event.DeleteEvent) bool { return clusterOperatorFilter(e.Object) },
-		})).
-		Complete(r)
+	watcher, err := NewObjectWatcher(WatcherOptions{
+		Cache:  mgr.GetCache(),
+		Scheme: mgr.GetScheme(),
+	})
+	if err != nil {
+		return err
+	}
+	r.watcher = watcher
+
+	build := ctrl.NewControllerManagedBy(mgr).
+		For(
+			&configv1.ClusterOperator{},
+			builder.WithPredicates(clusterOperatorPredicates()),
+		).
+		Watches(
+			&source.Kind{Type: r.Object()},
+			handler.EnqueueRequestsFromMapFunc(toClusterOperator),
+		).
+		Watches(
+			&source.Channel{Source: watcher.EventStream()},
+			handler.EnqueueRequestsFromMapFunc(toClusterOperator),
+		)
+
+	return build.Complete(r)
 }
 
-func clusterOperatorFilter(obj runtime.Object) bool {
-	clusterOperator, ok := obj.(*configv1.ClusterOperator)
-	return ok && clusterOperator.GetName() == clusterOperatorName
+func clusterOperatorPredicates() predicate.Funcs {
+	isClusterOperator := func(obj runtime.Object) bool {
+		clusterOperator, ok := obj.(*configv1.ClusterOperator)
+		return ok && clusterOperator.GetName() == clusterOperatorName
+	}
+
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return isClusterOperator(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return isClusterOperator(e.ObjectNew) },
+		GenericFunc: func(e event.GenericEvent) bool { return isClusterOperator(e.Object) },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return isClusterOperator(e.Object) },
+	}
+}
+
+func toClusterOperator(client.Object) []reconcile.Request {
+	return []reconcile.Request{{
+		NamespacedName: client.ObjectKey{Name: clusterOperatorName},
+	}}
 }
