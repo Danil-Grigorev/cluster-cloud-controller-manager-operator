@@ -13,6 +13,8 @@ import (
 
 var _ PlatformOwner = &InfrastrucutreOwner{}
 
+const InfrastructureKey = "infrastructure"
+
 type InfrastrucutreOwner struct {
 	objects []configv1.Infrastructure
 }

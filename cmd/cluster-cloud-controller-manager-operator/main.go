@@ -34,6 +34,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 
 	configv1 "github.com/openshift/api/config/v1"
+	clusterctlv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+
 	"github.com/openshift/cluster-cloud-controller-manager-operator/controllers"
 	"github.com/openshift/cluster-cloud-controller-manager-operator/pkg/platform"
 	// +kubebuilder:scaffold:imports
@@ -54,7 +56,7 @@ const defaultManagedNamespace = "cluster-cloud-controller-manager"
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(configv1.AddToScheme(scheme))
-
+	utilruntime.Must(clusterctlv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -98,6 +100,12 @@ func main() {
 		"The namespace for managed objects, where out-of-tree CCM binaries will run.",
 	)
 
+	platformResource := flag.String(
+		"platform-resource",
+		platform.InfrastructureKey,
+		"Platform resource responsible for populating cloud configuration resources.",
+	)
+
 	flag.Parse()
 
 	ctrl.SetLogger(klogr.New().WithName("CCMOperator"))
@@ -124,7 +132,7 @@ func main() {
 
 	if err = (&controllers.CloudOperatorReconciler{
 		Client:        mgr.GetClient(),
-		PlatformOwner: &platform.InfrastrucutreOwner{},
+		PlatformOwner: platform.GetPlatform(*platformResource, *managedNamespace),
 		Scheme:        mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterOperator")
